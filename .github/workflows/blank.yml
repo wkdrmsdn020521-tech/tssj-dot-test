@@ -1,0 +1,156 @@
+name: fetch-images
+
+on:
+  schedule:
+    - cron: "30 */1 * * *"
+  workflow_dispatch: {}
+
+# 동시에 같은 브랜치에 두 런이 푸시하지 않도록
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0           # pull --rebase 가능하도록 전체 히스토리
+          persist-credentials: true # 기본값이지만 명시
+
+      - name: Prepare folders and clean old GIFs
+        shell: bash
+        run: |
+          mkdir -p images
+          test -f images/catalog.json || echo '{"files":[]}' > images/catalog.json
+          find images -name "*.gif" -delete
+          echo "Deleted old GIF files."
+
+      - name: Install ImageMagick
+        run: sudo apt-get update && sudo apt-get install -y imagemagick
+
+      - name: Download images
+        shell: bash
+        run: |
+          URLS=(
+            "https://backend.wplace.live/files/s0/tiles/656/1524.png"
+            "https://backend.wplace.live/files/s0/tiles/656/1525.png"
+            "https://backend.wplace.live/files/s0/tiles/657/1525.png"
+            "https://backend.wplace.live/files/s0/tiles/657/1524.png"
+            "https://backend.wplace.live/files/s0/tiles/1740/790.png"
+          )
+          DAYTIM="$(TZ=Asia/Seoul date +'%Y%m%d_%H%M%S')"
+          for u in "${URLS[@]}"; do
+            path="${u#*/tiles/}"
+            AREA="${path%%/*}"
+            COORD="${path#*/}"
+            Y="${COORD%.*}"
+            folder="${AREA}x${Y}"
+            name="${DAYTIM}_${folder}.png"
+            output_path="images/${folder}/${name}"
+            mkdir -p "images/${folder}"
+            if curl -L --fail --silent --show-error -o "$output_path" "$u"; then
+              echo "Saved $output_path"
+            else
+              echo "Download failed or empty for $u" >&2
+              exit 1
+            fi
+          done
+
+      - name: Create GIFs
+        shell: bash
+        run: |
+          for dir in images/*/; do
+            [ -d "$dir" ] || continue
+            readarray -t png_files < <(find "$dir" -name "*.png" | sort)
+            if [ "${#png_files[@]}" -gt 0 ]; then
+              gif_name=$(basename "$dir")
+              output_path="images/${gif_name}.gif"
+              if [ "${#png_files[@]}" -eq 1 ]; then
+                convert -delay 300 -loop 0 -dispose Background "${png_files[0]}" "$output_path"
+              else
+                last_file="${png_files[${#png_files[@]}-1]}"
+                unset 'png_files[${#png_files[@]}-1]'
+                convert \
+                  -delay 20 "${png_files[@]}" \
+                  -delay 300 "$last_file" \
+                  -loop 0 -dispose Background \
+                  "$output_path"
+              fi
+              echo "Generated GIF: $output_path"
+            else
+              echo "No images found in $dir to create a GIF."
+            fi
+          done
+
+      - name: Update catalog.json
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const crypto = require('crypto');
+          const dir = 'images';
+          const catalogPath = path.join(dir, 'catalog.json');
+          let catalog = { files: [] };
+          if (fs.existsSync(catalogPath)) {
+            try { catalog = JSON.parse(fs.readFileSync(catalogPath, 'utf8') || '{"files":[]}'); }
+            catch { catalog = { files: [] }; }
+          }
+          function getFilesInDirectory(dirPath) {
+            let results = [];
+            const files = fs.readdirSync(dirPath);
+            for (const file of files) {
+              const filePath = path.join(dirPath, file);
+              const stat = fs.statSync(filePath);
+              if (stat.isDirectory()) {
+                results = results.concat(getFilesInDirectory(filePath));
+              } else if (/\.(png|jpg|jpeg|gif|webp)$/i.test(file)) {
+                results.push(filePath);
+              }
+            }
+            return results;
+          }
+          const allImageFiles = getFilesInDirectory(dir);
+          const known = new Set(catalog.files.map(x => x.name));
+          for (const p of allImageFiles) {
+            const relativePath = path.relative(dir, p).replace(/\\/g, '/');
+            if (!known.has(relativePath)) {
+              try {
+                const sha = crypto.createHash('md5').update(fs.readFileSync(p)).digest('hex').slice(0, 12);
+                catalog.files.push({ name: relativePath, sha, ts: new Date().toISOString() });
+              } catch(e) {
+                console.error(`Failed to process file ${p}: ${e.message}`);
+              }
+            }
+          }
+          catalog.files = catalog.files.sort((a,b)=>a.name.localeCompare(b.name)).slice(-2000);
+          fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2));
+          console.log('files in catalog:', catalog.files.length);
+          NODE
+
+      - name: Rebase with remote and push (avoid non-fast-forward)
+        shell: bash
+        run: |
+          set -e
+          git config user.email "actions@users.noreply.github.com"
+          git config user.name "github-actions"
+
+          # 최신 원격 커밋을 먼저 반영
+          git fetch origin
+          # 현재 브랜치 이름(대부분 main)
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          git pull --rebase origin "$BRANCH"
+
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: fetch images and create GIFs [skip ci]"
+            # 명시적으로 현재 HEAD를 main에 푸시
+            git push origin HEAD:"$BRANCH"
+          else
+            echo "No changes to commit."
+          fi
