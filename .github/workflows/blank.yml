@@ -34,7 +34,7 @@ jobs:
             "https://backend.wplace.live/files/s0/tiles/656/1525.png"
             "https://backend.wplace.live/files/s0/tiles/657/1525.png"
             "https://backend.wplace.live/files/s0/tiles/657/1524.png"
-            "https://backend.wplace.live/files/s0/tiles/1740/790.png"
+            "https://backend.wplace.live/files/s0/tiles/1738/786.png"
           )
 
           DAYTIM="$(TZ=Asia/Seoul date +'%Y%m%d_%H%M%S')"
